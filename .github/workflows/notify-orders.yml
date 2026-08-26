@@ -1,0 +1,36 @@
+name: Notify staff of new Yandex Market orders
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write .env
+        run: |
+          cat <<EOF > .env
+          YANDEX_MARKET_API_KEY=${{ secrets.YANDEX_MARKET_API_KEY }}
+          YANDEX_MARKET_CAMPAIGN_ID=${{ secrets.YANDEX_MARKET_CAMPAIGN_ID }}
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_STAFF_CHAT_ID=${{ secrets.TELEGRAM_STAFF_CHAT_ID }}
+          EOF
+
+      - name: Check for new orders and notify
+        working-directory: scripts
+        run: python3 notify_new_orders.py
+
+      - name: Persist notified-order state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add notified_orders.json
+          git diff --cached --quiet || git commit -m "Update notified orders state [skip ci]"
+          git push
