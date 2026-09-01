@@ -19,15 +19,24 @@ Yandex still auto-cancels a DBS order (substatus SHOP_FAILED) if the seller
 doesn't respond in time, so the "new order" ping is still the main point -
 this just adds "and here's what happened to it" as a second guarantee.
 
+Also sends a daily heartbeat and a Telegram alert on any real failure
+(bad API response, network error, etc.) - a notifier that only ever speaks
+when there's an order is indistinguishable, from the staff side, from one
+that's silently broken. Asadbek asked for exactly this: "I don't know
+whether it is working or not unless someone creates an order."
+
 Usage:
   python3 notify_new_orders.py            # check and send
-  python3 notify_new_orders.py --dry-run  # print what would be sent, don't send or save state
+  python3 notify_new_orders.py --dry-run  # print what would be sent, don't send, save nothing
 """
-import json, subprocess, os, sys
-from datetime import datetime
+import json, subprocess, os, sys, traceback
+from datetime import datetime, timezone
 from build_offers import load_env, _SCRIPT_DIR
 
 YANDEX_DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
+# Reserved key in the same state dict as order ids - order ids from Yandex
+# are always numeric strings, so this can never collide with a real one.
+HEARTBEAT_KEY = "__last_heartbeat_date__"
 
 STATE_PATH = os.path.join(_SCRIPT_DIR, '..', 'notified_orders.json')
 DASHBOARD_URL = "https://partner.market.yandex.uz/business/216979546/orders?campaignId=149239236&tabId=dbsProcessing&tabGroupId=dbs"
@@ -181,9 +190,56 @@ def send_telegram(bot_token, chat_id, text):
         raise RuntimeError(f"Telegram sendMessage failed: {out.stdout}")
 
 
-def main():
-    dry_run = '--dry-run' in sys.argv
+def maybe_send_heartbeat(state, bot_token, chat_id, active_count, dry_run):
+    """
+    Once per UTC calendar day: a short "still alive" ping. A notifier that
+    only ever speaks when there's an order is indistinguishable, from the
+    staff side, from one that's silently broken - this is the difference
+    between "no orders today" and "is this thing even running?".
+    Returns True if a heartbeat was (or, in dry-run, would be) sent.
+    """
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    if state.get(HEARTBEAT_KEY) == today:
+        return False
 
+    text = (
+        "✅ <b>Yandex Market bot ishlamoqda</b>\n\n"
+        f"Kunlik holat tekshiruvi — {today} (UTC)\n"
+        f"Hozir faol (PROCESSING) buyurtmalar: {active_count}\n\n"
+        "Bu xabar botning har 5 daqiqada ishlab turganini tasdiqlash uchun "
+        "kuniga bir marta yuboriladi - agar bu xabar kelmasa, bot ishlamayapti demakdir."
+    )
+    if dry_run:
+        print(f"--- would send heartbeat ---\n{text}\n")
+    else:
+        send_telegram(bot_token, chat_id, text)
+        state[HEARTBEAT_KEY] = today
+    return True
+
+
+def send_failure_alert(bot_token, chat_id, exc):
+    """
+    Best-effort - if this itself fails (network down, bad credentials),
+    there's nothing left to do but let the GitHub Actions run show red,
+    which is the fallback signal when even the alert can't get out.
+    """
+    try:
+        send_telegram(
+            bot_token, chat_id,
+            "🔴 <b>Yandex Market bot xatolik bilan to'xtadi</b>\n\n"
+            f"<code>{escape_html(f'{type(exc).__name__}: {exc}')}</code>\n\n"
+            "Keyingi (5 daqiqadan keyingi) urinish avtomatik bo'ladi. Agar bu "
+            "takrorlansa, GitHub Actions loglarini tekshiring.",
+        )
+    except Exception:
+        pass
+
+
+def escape_html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def run(dry_run):
     env = load_env()
     token = env.get('YANDEX_MARKET_API_KEY')
     campaign_id = env.get('YANDEX_MARKET_CAMPAIGN_ID')
@@ -196,7 +252,18 @@ def main():
         )
 
     state = load_state()
-    orders = fetch_orders(token, campaign_id)
+
+    try:
+        orders = fetch_orders(token, campaign_id)
+    except Exception as exc:
+        # The one failure mode staff actually need to know about in real
+        # time: the check itself is broken (bad token, Yandex API change,
+        # network issue). Everything below this can't run without `orders`,
+        # so there's nothing left to do but alert and stop.
+        traceback.print_exc()
+        if not dry_run:
+            send_failure_alert(bot_token, chat_id, exc)
+        raise
 
     sent = 0
     for order in orders:
@@ -222,10 +289,21 @@ def main():
             state[oid] = status
         sent += 1
 
-    if sent and not dry_run:
+    active_count = sum(1 for o in orders if o['status'] == 'PROCESSING')
+    heartbeat_sent = maybe_send_heartbeat(state, bot_token, chat_id, active_count, dry_run)
+
+    if (sent or heartbeat_sent) and not dry_run:
         save_state(state)
 
-    print(f"checked {len(orders)} order(s), {'would notify' if dry_run else 'notified'} {sent}")
+    print(
+        f"checked {len(orders)} order(s), "
+        f"{'would notify' if dry_run else 'notified'} {sent}"
+        f"{', heartbeat sent' if heartbeat_sent else ''}"
+    )
+
+
+def main():
+    run(dry_run='--dry-run' in sys.argv)
 
 
 if __name__ == '__main__':

@@ -2,7 +2,10 @@ name: Notify staff of new Yandex Market orders
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # 5 minutes is GitHub Actions' shortest supported interval for scheduled
+    # workflows - actual runs can still lag behind this during periods of
+    # high GitHub load (documented behavior, not something we control).
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
