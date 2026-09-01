@@ -1,41 +1,78 @@
 """
-Notifies the staff Telegram group about new Yandex Market (DBS) orders that
-need action. Yandex auto-cancels a DBS order (substatus SHOP_FAILED) if the
-seller doesn't respond in time, so getting this in front of staff fast is
-the whole point - this isn't a nice-to-have digest, it's a "don't lose the
-order" alert.
+Notifies the staff Telegram group about Yandex Market (DBS) orders that need
+action or attention - both new orders sitting in PROCESSING, and orders that
+have since been CANCELLED (with the reason), so a decline is never silent.
 
-Polls orders with status=PROCESSING (the dashboard's "dbsProcessing" tab),
-tracks which order ids have already been notified in ../notified_orders.json
-(so a re-run every few minutes doesn't re-send the same order), and sends
-one Telegram message per order the first time it's seen - via @noutone_shop_bot,
-the same bot that already sends consult/lead notifications from the Mini App
-and website, into the same staff group.
+Originally polled status=PROCESSING only and only ever sent a "new order"
+message. That missed orders cancelled fast: order 61086716033 was created
+and CANCELLED (substatus USER_REFUSED_DELIVERY) under 2 minutes later; order
+61079158019 similarly (USER_BOUGHT_CHEAPER, ~71 seconds). A 10-minute poll
+against PROCESSING-only can't ever catch those - by the time it runs, the
+order has already left PROCESSING and drops out of that filter entirely, and
+there was no code path for reporting a cancellation anyway. Fetching
+PROCESSING+CANCELLED together and tracking each order's last-notified status
+(not just "seen or not") fixes both: a short-lived order is reported once,
+already showing CANCELLED and why; a longer-lived one gets the original "new
+order" ping, then a follow-up when it's cancelled later.
+
+Yandex still auto-cancels a DBS order (substatus SHOP_FAILED) if the seller
+doesn't respond in time, so the "new order" ping is still the main point -
+this just adds "and here's what happened to it" as a second guarantee.
 
 Usage:
   python3 notify_new_orders.py            # check and send
   python3 notify_new_orders.py --dry-run  # print what would be sent, don't send or save state
 """
 import json, subprocess, os, sys
+from datetime import datetime
 from build_offers import load_env, _SCRIPT_DIR
+
+YANDEX_DATE_FORMAT = "%d-%m-%Y %H:%M:%S"
 
 STATE_PATH = os.path.join(_SCRIPT_DIR, '..', 'notified_orders.json')
 DASHBOARD_URL = "https://partner.market.yandex.uz/business/216979546/orders?campaignId=149239236&tabId=dbsProcessing&tabGroupId=dbs"
 
+# Cancellation reasons actually seen, translated for the staff message.
+# Anything not listed here still gets reported - just with the raw Yandex
+# code instead of a translated label - so a new/rare substatus never
+# silently vanishes from the notification.
+CANCEL_REASONS = {
+    "USER_REFUSED_DELIVERY": "Xaridor yetkazib berish/olib ketishdan voz kechdi",
+    "USER_REFUSED_PRODUCT": "Xaridor mahsulotdan voz kechdi",
+    "USER_REFUSED_QUALITY": "Xaridor mahsulot sifatidan norozi bo'ldi",
+    "USER_CHANGED_MIND": "Xaridor fikridan qaytdi",
+    "USER_UNREACHABLE": "Xaridor bilan bog'lanib bo'lmadi",
+    "USER_BOUGHT_CHEAPER": "Xaridor arzonroq narxda boshqa joydan oldi",
+    "SHOP_FAILED": "Do'kon belgilangan vaqtda javob bermadi (avtomatik bekor qilindi)",
+    "OUT_OF_DATE": "Buyurtma muddati tugadi",
+    "REPLACING_ORDER": "Buyurtma boshqasi bilan almashtirildi",
+}
+
 
 def load_state():
-    if os.path.exists(STATE_PATH):
-        return set(json.load(open(STATE_PATH, encoding='utf-8')))
-    return set()
+    """
+    {order_id: last_notified_status} - upgraded from a flat "seen" list so a
+    status change (PROCESSING -> CANCELLED) can be detected and reported,
+    not just the order's first appearance. Transparently upgrades the old
+    flat-list format (every id treated as already-fully-handled) so a
+    re-run right after this change doesn't re-notify every historical order.
+    """
+    if not os.path.exists(STATE_PATH):
+        return {}
+    data = json.load(open(STATE_PATH, encoding='utf-8'))
+    if isinstance(data, list):
+        return {oid: 'CANCELLED' for oid in data}
+    return data
 
 
-def save_state(ids):
-    json.dump(sorted(ids), open(STATE_PATH, 'w', encoding='utf-8'), indent=2)
+def save_state(state):
+    json.dump(state, open(STATE_PATH, 'w', encoding='utf-8'), indent=2, sort_keys=True, ensure_ascii=False)
 
 
-def fetch_processing_orders(token, campaign_id):
+def fetch_orders(token, campaign_id):
     out = subprocess.run(
-        ["curl", "-s", f"https://api.partner.market.yandex.ru/campaigns/{campaign_id}/orders?status=PROCESSING&pageSize=50",
+        ["curl", "-s", f"https://api.partner.market.yandex.ru/campaigns/{campaign_id}/orders"
+                        f"?status=PROCESSING,CANCELLED&pageSize=50",
          "-H", f"Api-Key: {token}"],
         capture_output=True, text=True, timeout=30,
     )
@@ -45,7 +82,25 @@ def fetch_processing_orders(token, campaign_id):
     return data['orders']
 
 
-def format_message(order):
+def format_elapsed(created_str, updated_str):
+    """'2 daqiqa', '10 soat 37 daqiqa' - or None if either timestamp is
+    missing/unparseable, in which case the caller falls back to not
+    claiming a duration at all rather than showing a wrong one."""
+    if not created_str or not updated_str:
+        return None
+    try:
+        created = datetime.strptime(created_str, YANDEX_DATE_FORMAT)
+        updated = datetime.strptime(updated_str, YANDEX_DATE_FORMAT)
+    except ValueError:
+        return None
+    total_minutes = max(0, int((updated - created).total_seconds() // 60))
+    hours, minutes = divmod(total_minutes, 60)
+    if hours == 0:
+        return f"{minutes} daqiqa" if minutes else "1 daqiqadan kam"
+    return f"{hours} soat {minutes} daqiqa" if minutes else f"{hours} soat"
+
+
+def order_summary_lines(order):
     items = order.get('items', [])
     item_lines = "\n".join(f"• {i['offerName']} x{i['count']} — {i['price']:,.0f} so'm" for i in items)
 
@@ -56,11 +111,7 @@ def format_message(order):
     address = order.get('delivery', {}).get('address', {})
     addr_str = ", ".join(filter(None, [address.get('city'), address.get('street'), address.get('house')])) or "—"
 
-    notes = order.get('notes')
-
     lines = [
-        "🛒 <b>Yangi Yandex Market buyurtma</b>",
-        "",
         f"Buyurtma ID: <code>{order['id']}</code>",
         item_lines,
         "",
@@ -68,15 +119,53 @@ def format_message(order):
         f"📞 {phone}",
         f"📍 {addr_str}",
     ]
+    notes = order.get('notes')
     if notes:
         lines.append(f"📝 {notes}")
+    lines.append(f"💰 Jami: {order.get('buyerTotal', 0):,.0f} so'm")
+    return lines
+
+
+def format_new_order_message(order):
+    lines = ["🛒 <b>Yangi Yandex Market buyurtma</b>", ""]
+    lines += order_summary_lines(order)
     lines += [
-        "",
-        f"💰 Jami: {order.get('buyerTotal', 0):,.0f} so'm",
         "",
         "⚠️ Yandex belgilangan vaqt ichida javob bo'lmasa buyurtmani avtomatik bekor qiladi — tezroq javob bering.",
         DASHBOARD_URL,
     ]
+    return "\n".join(lines)
+
+
+def format_cancelled_message(order, *, already_cancelled_on_first_sight):
+    substatus = order.get('substatus') or ''
+    reason = CANCEL_REASONS.get(substatus, substatus or "Sabab ko'rsatilmagan")
+
+    if already_cancelled_on_first_sight:
+        # We never saw this order while it was still PROCESSING - it was
+        # created and cancelled inside one polling gap. Say so explicitly so
+        # staff don't wonder why there was no earlier "new order" ping. Show
+        # the actual elapsed time rather than asserting it was fast - this
+        # message also fires for old orders that sat for hours before being
+        # auto-cancelled (never caught because this script didn't exist
+        # yet), where "cancelled instantly" would be misleading.
+        header = "⚠️ <b>Buyurtma yaratilib, keyin bekor qilingan</b>"
+        elapsed = format_elapsed(order.get('creationDate'), order.get('updatedAt'))
+        note = (
+            f"Bu buyurtma {elapsed} ichida bekor qilingani uchun \"yangi buyurtma\" xabari yuborilmagan edi."
+            if elapsed
+            else "Bu buyurtma \"yangi buyurtma\" bosqichida ko'rinmay, to'g'ridan-to'g'ri bekor qilingan holda topildi."
+        )
+    else:
+        header = "❌ <b>Yandex Market buyurtma bekor qilindi</b>"
+        note = None
+
+    lines = [header, ""]
+    lines += order_summary_lines(order)
+    lines += ["", f"🚫 Sabab: {reason}"]
+    if note:
+        lines += ["", note]
+    lines.append(DASHBOARD_URL)
     return "\n".join(lines)
 
 
@@ -106,26 +195,37 @@ def main():
             "TELEGRAM_STAFF_CHAT_ID in ../.env"
         )
 
-    notified = load_state()
-    orders = fetch_processing_orders(token, campaign_id)
+    state = load_state()
+    orders = fetch_orders(token, campaign_id)
 
-    new_count = 0
+    sent = 0
     for order in orders:
         oid = str(order['id'])
-        if oid in notified:
+        status = order['status']
+        last_notified = state.get(oid)
+
+        if last_notified is None and status == 'PROCESSING':
+            message = format_new_order_message(order)
+        elif last_notified is None and status == 'CANCELLED':
+            message = format_cancelled_message(order, already_cancelled_on_first_sight=True)
+        elif last_notified == 'PROCESSING' and status == 'CANCELLED':
+            message = format_cancelled_message(order, already_cancelled_on_first_sight=False)
+        else:
+            # Already fully reported for its current status (or nothing new
+            # to say - e.g. still PROCESSING and we already pinged that).
             continue
-        message = format_message(order)
+
         if dry_run:
-            print(f"--- would notify order {oid} ---\n{message}\n")
+            print(f"--- would notify order {oid} ({status}) ---\n{message}\n")
         else:
             send_telegram(bot_token, chat_id, message)
-            notified.add(oid)
-        new_count += 1
+            state[oid] = status
+        sent += 1
 
-    if new_count and not dry_run:
-        save_state(notified)
+    if sent and not dry_run:
+        save_state(state)
 
-    print(f"checked {len(orders)} processing order(s), {'would notify' if dry_run else 'notified'} {new_count} new")
+    print(f"checked {len(orders)} order(s), {'would notify' if dry_run else 'notified'} {sent}")
 
 
 if __name__ == '__main__':
