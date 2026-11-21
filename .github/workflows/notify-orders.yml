@@ -1,11 +1,10 @@
 name: Notify staff of new Yandex Market orders
 
+# SWITCHED OFF 2026-11-21 at Asadbek's request: schedule removed, manual run
+# only. To turn it back on, restore:
+#   schedule:
+#     - cron: "*/5 * * * *"
 on:
-  schedule:
-    # 5 minutes is GitHub Actions' shortest supported interval for scheduled
-    # workflows - actual runs can still lag behind this during periods of
-    # high GitHub load (documented behavior, not something we control).
-    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
